@@ -21,10 +21,8 @@ const { handle } = createApp({
 });
 
 export default function handler(req, res) {
-  const url = req.url || "/";
-  if (!url.startsWith("/api")) {
-    const path = url.startsWith("/") ? url : `/${url}`;
-    req.url = path === "/" ? "/api" : `/api${path}`;
-  }
+  const headerPath = req.headers["x-forwarded-uri"] || req.headers["x-invoke-path"] || req.headers["x-vercel-forwarded-path"];
+  const url = String(headerPath || req.url || "/api/health");
+  req.url = url.startsWith("/api") ? url : `/api${url.startsWith("/") ? url : `/${url}`}`;
   return handle(req, res);
 }
