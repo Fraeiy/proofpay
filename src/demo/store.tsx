@@ -40,6 +40,7 @@ export type TxView = {
 
 export type Profile = {
   wallet: string;
+  wallets?: string[];
   displayName: string;
   intent: "freelance" | "hire" | "both";
   preferredView: Role;
@@ -83,8 +84,11 @@ export type DemoApi = {
   saveAgreement: (
     existingId: string | null,
     form: AgreementInput,
-    mode: "draft" | "share",
-  ) => Promise<{ ok: true; id: string } | { ok: false; error: string; errors?: FieldErrors }>;
+    mode: "draft" | "share" | "invite",
+  ) => Promise<{ ok: true; id: string; path?: string } | { ok: false; error: string; errors?: FieldErrors }>;
+  confirmClient: (id: string) => Promise<{ ok: boolean; error?: string }>;
+  declineClient: (id: string) => Promise<{ ok: boolean; error?: string }>;
+  switchWallet: (wallet: string) => Promise<void>;
   deleteDraft: (id: string) => Promise<{ ok: boolean; error?: string }>;
   acceptAgreement: (id: string, termsRef: string) => Promise<{ ok: boolean; error?: string }>;
   submitWork: (input: { agreementId: string; milestoneId: string; note: string; links: Array<{ label: string; url: string }> }) => Promise<{ ok: boolean; error?: string }>;
@@ -131,7 +135,14 @@ export function DemoProvider({ children, repository = browserDemoRepository }: {
       signOut: async () => undefined,
       setTheme: () => undefined,
       saveProfile: async () => undefined,
-      downloadReceipt: async () => setNotice({ tone: "danger", title: "Sample receipts stay in this browser. They are simulated and have no explorer link." }),
+      downloadReceipt: async () => {
+        try {
+          const { downloadReceiptFile } = await import("../live/api");
+          await downloadReceiptFile("sample");
+        } catch (error) {
+          setNotice({ tone: "danger", title: "The simulated receipt did not download.", detail: error instanceof Error ? error.message : "Try again." });
+        }
+      },
       faucet: async () => undefined,
       reviseAgreement: async () => ({ ok: false, error: "Sample agreements stay in this browser." }),
       state,
@@ -151,7 +162,11 @@ export function DemoProvider({ children, repository = browserDemoRepository }: {
         setTx(null);
         setNotice({ tone: "ok", title: "Demo data reset." });
       },
+      confirmClient: async () => ({ ok: false, error: "Sample mode does not confirm a client wallet." }),
+      declineClient: async () => ({ ok: false, error: "Sample mode does not confirm a client wallet." }),
+      switchWallet: async () => undefined,
       saveAgreement: async (existingId, form, mode) => {
+        if (mode === "invite") return { ok: false, error: "Invitation links are for a signed-in workspace. Sample mode stays in this browser." };
         const drafted = upsertDraft(stateRef.current, existingId, form, AMARA);
         if (!drafted.ok || !drafted.id) return { ok: false, error: drafted.ok ? "Could not save the draft." : drafted.error };
         if (mode === "draft") {

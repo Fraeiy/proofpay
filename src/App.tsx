@@ -2,6 +2,7 @@ import { createBrowserRouter, RouterProvider } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
 import { EmptyState } from "./components/EmptyState";
 import { ButtonLink, usePageTitle } from "./components/ui";
+import { PrivyGate } from "./auth/PrivyGate";
 import { DemoProvider } from "./demo/store";
 import { LiveProvider } from "./live/store";
 import { readMode } from "./mode";
@@ -11,6 +12,7 @@ import { CreateAgreement } from "./screens/CreateAgreement";
 import { Overview } from "./screens/Overview";
 import { Payments } from "./screens/Payments";
 import { ReceiptPage } from "./screens/ReceiptPage";
+import { InvitePage } from "./screens/InvitePage";
 import { Welcome } from "./screens/Welcome";
 
 function NotFound() {
@@ -24,6 +26,7 @@ function NotFound() {
 
 const router = createBrowserRouter([
   { path: "/", element: <Welcome /> },
+  { path: "/invite/:token", element: <InvitePage /> },
   {
     element: <AppShell />,
     children: [
@@ -42,5 +45,6 @@ const router = createBrowserRouter([
 export function App() {
   const preview = readMode() === "preview";
   const shell = <RouterProvider router={router} />;
-  return preview ? <DemoProvider>{shell}</DemoProvider> : <LiveProvider>{shell}</LiveProvider>;
+  if (preview) return <DemoProvider>{shell}</DemoProvider>;
+  return <PrivyGate><LiveProvider>{shell}</LiveProvider></PrivyGate>;
 }

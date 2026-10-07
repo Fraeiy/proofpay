@@ -13,13 +13,20 @@ export type ChainConfig = {
   configured: boolean;
 };
 
-type EthereumProvider = {
+export type EthereumProvider = {
   request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
   on?: (event: string, listener: (...args: unknown[]) => void) => void;
   removeListener?: (event: string, listener: (...args: unknown[]) => void) => void;
 };
 
+let activeProvider: EthereumProvider | null = null;
+
+export function setActiveProvider(provider: EthereumProvider | null) {
+  activeProvider = provider;
+}
+
 export function ethereum(): EthereumProvider | null {
+  if (activeProvider) return activeProvider;
   const provider = (window as Window & { ethereum?: EthereumProvider }).ethereum;
   return provider ?? null;
 }
@@ -36,7 +43,7 @@ export function walletChain(config: ChainConfig): Chain {
 
 export async function connectAccount(): Promise<Address> {
   const provider = ethereum();
-  if (!provider) throw new Error("No wallet was found. On a phone, open ProofPay in your wallet’s browser and try again.");
+  if (!provider) throw new Error("No wallet was found. Continue with Google or email, or connect an existing wallet.");
   const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
   const account = accounts[0];
   if (!account) throw new Error("Choose an account in your wallet to continue.");

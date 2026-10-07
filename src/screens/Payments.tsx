@@ -21,7 +21,7 @@ export function Payments() {
   const [query, setQuery] = useState("");
   const rows = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    const ledger = viewSlice(demo.state.agreements, demo.state.ledger, demo.state.role, demo.sessionWallet).ledger;
+    const ledger = viewSlice(demo.state.agreements, demo.state.ledger, demo.state.role, demo.profile?.wallets?.length ? demo.profile.wallets : demo.sessionWallet).ledger;
     return ledger.filter((entry) => {
       if (!matchesLedgerFilter(entry, filter)) return false;
       if (!needle) return true;

@@ -37,8 +37,10 @@ export function CreateAgreement() {
   const [form, setForm] = useState<AgreementInput>(() => existing?.draft ?? emptyAgreement(createId("ms")));
   const [step, setStep] = useState<Step>(1);
   const [errors, setErrors] = useState<FieldErrors>({});
+  const [formError, setFormError] = useState("");
   const [confirmTemplate, setConfirmTemplate] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [invitePath, setInvitePath] = useState("");
   const baseline = useRef(JSON.stringify(existing?.draft ?? form));
   const allowLeave = useRef(false);
   const headingRef = useRef<HTMLHeadingElement>(null);
@@ -85,7 +87,7 @@ export function CreateAgreement() {
   }
 
   function goNext() {
-    const found = errorsForStep(validateAgreementInput(form, demo.sessionWallet ?? AMARA.wallet, todayISO()), step);
+    const found = errorsForStep(validateAgreementInput(form, demo.sessionWallet ?? AMARA.wallet, todayISO(), { requireClient: !(demo.mode === "live" && !form.clientWallet.trim()) }), step);
     setErrors(found);
     if (hasErrors(found)) {
       const key = firstErrorKey(found);
@@ -95,9 +97,9 @@ export function CreateAgreement() {
     setStep((current) => (current < 3 ? ((current + 1) as Step) : current));
   }
 
-  async function save(mode: "draft" | "share") {
-    if (mode === "share") {
-      const found = validateAgreementInput(form, demo.sessionWallet ?? AMARA.wallet, todayISO());
+  async function save(mode: "draft" | "share" | "invite") {
+    if (mode === "share" || mode === "invite") {
+      const found = validateAgreementInput(form, demo.sessionWallet ?? AMARA.wallet, todayISO(), { requireClient: mode !== "invite" });
       if (hasErrors(found)) {
         setErrors(found);
         const key = firstErrorKey(found);
@@ -110,6 +112,7 @@ export function CreateAgreement() {
     }
     const result = await demo.saveAgreement(existing?.id ?? null, form, mode);
     if (!result.ok) {
+      setFormError(result.error ?? "Could not save the agreement.");
       if (result.errors) {
         setErrors(result.errors);
         const key = firstErrorKey(result.errors);
@@ -117,8 +120,13 @@ export function CreateAgreement() {
       }
       return;
     }
+    setFormError("");
     baseline.current = JSON.stringify(form);
     allowLeave.current = true;
+    if (result.path) {
+      setInvitePath(`${window.location.origin}${result.path}`);
+      return;
+    }
     navigate(mode === "share" ? `/agreements/${result.id}` : `/agreements/${result.id}/edit`);
   }
 
@@ -128,7 +136,7 @@ export function CreateAgreement() {
   return (
     <div>
       <div className="mx-auto min-w-0 max-w-3xl px-4 py-6 lg:px-6">
-        <PageIntro title={editing ? "Edit draft" : "New agreement"} lede={demo.mode === "live" ? "You are the freelancer on this agreement. The client sees it after your wallet commits these terms." : "You are Amara Cole, the freelancer. The client sees this only after you share it."} />
+        <PageIntro title={editing ? "Edit draft" : "New agreement"} lede={demo.mode === "live" ? "You are the freelancer on this agreement. Creating one does not change which list you are viewing." : demo.state.role === "client" ? "This sample is showing the client list. New sample agreements are created as the freelancer, Amara Cole." : "You are Amara Cole, the freelancer. The client sees this only after you share it."} />
         <ol className="mb-6 grid grid-cols-3 gap-2" aria-label="Progress">
           {([1, 2, 3] as Step[]).map((number) => (
             <li key={number}>
@@ -151,7 +159,7 @@ export function CreateAgreement() {
             </div>
             <TextField id="title" label="Agreement title" value={form.title} error={errors.title} onChange={(event) => update("title", event.target.value)} />
             <TextField id="clientName" label="Client name" value={form.clientName} error={errors.clientName} onChange={(event) => update("clientName", event.target.value)} />
-            <TextField id="clientWallet" label="Client wallet address" value={form.clientWallet} error={errors.clientWallet} spellCheck={false} autoComplete="off" hint={demo.mode === "live" ? "0x and 40 hex characters. This must be a different wallet from yours." : "0x and 40 hex characters. This sample does not check that the address exists."} onChange={(event) => update("clientWallet", event.target.value)} />
+            <TextField id="clientWallet" label="Client wallet address" value={form.clientWallet} error={errors.clientWallet} spellCheck={false} autoComplete="off" hint={demo.mode === "live" ? "Optional if you send an invitation link. Otherwise 0x and 40 hex characters, different from your wallet." : "0x and 40 hex characters. This sample does not check that the address exists."} onChange={(event) => update("clientWallet", event.target.value)} />
             <p className="text-sm text-muted">Freelancer: {demo.profile?.displayName ?? AMARA.name} · {shortWallet(demo.sessionWallet ?? AMARA.wallet)}</p>
             <TextArea id="description" label="Work description" value={form.description} error={errors.description} onChange={(event) => update("description", event.target.value)} />
           </div>
@@ -215,13 +223,19 @@ export function CreateAgreement() {
           </div>
         ) : null}
       </div>
+      {formError ? <p className="mx-auto max-w-3xl px-4 pb-2 text-sm lg:px-6"><span className="error-text" role="alert">{formError}</span></p> : null}
       <div className="mt-6 border-t border-line bg-canvas">
         <div className="mx-auto flex max-w-3xl flex-wrap items-center justify-between gap-3 px-4 py-3 lg:px-6">
           <Button variant="ghost" onClick={() => (step === 1 ? navigate("/agreements") : setStep((current) => (current - 1) as Step))}>Back</Button>
           <div className="flex flex-wrap justify-end gap-2">
             {existing ? <Button variant="danger" onClick={() => setConfirmDelete(true)}>Delete draft</Button> : null}
             <Button variant="quiet" onClick={() => save("draft")}>Save draft</Button>
-            {step < 3 ? <Button onClick={goNext}>Continue</Button> : <Button onClick={() => save("share")}>Share with client</Button>}
+            {step < 3 ? <Button onClick={goNext}>Continue</Button> : (
+              <>
+                {demo.mode === "live" ? <Button variant="ink" onClick={() => save("invite")}>Create invitation link</Button> : null}
+                <Button onClick={() => save("share")}>Share with client wallet</Button>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -264,6 +278,15 @@ export function CreateAgreement() {
         }
       >
         <p className="text-sm">The client never saw this draft. Deleting it only removes it from this browser.</p>
+      </Dialog>
+      <Dialog
+        open={Boolean(invitePath)}
+        title="Send this invitation"
+        description="The client reviews the terms after they sign in. You still confirm their wallet before anyone can fund."
+        onClose={() => { setInvitePath(""); navigate("/agreements"); }}
+        footer={<Button onClick={() => { void navigator.clipboard.writeText(invitePath); }}>Copy link</Button>}
+      >
+        <p className="break-all text-sm">{invitePath}</p>
       </Dialog>
     </div>
   );

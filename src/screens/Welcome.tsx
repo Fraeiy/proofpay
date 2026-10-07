@@ -1,17 +1,78 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowUpRight } from "lucide-react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
+import { useAuth } from "../auth/PrivyGate";
 import { usePageTitle } from "../components/ui";
 import { Mark } from "../components/Wordmark";
 import { useDemo } from "../demo/store";
 import { enterMode } from "../mode";
-import { ethereum } from "../chain/wallet";
+
+function messageOf(reason: unknown, fallback: string) {
+  return reason instanceof Error ? reason.message : fallback;
+}
 
 export function Welcome() {
-  usePageTitle("Milestone payments");
+  usePageTitle("Sign in");
   const demo = useDemo();
+  const auth = useAuth();
+  const navigate = useNavigate();
+  const codeRef = useRef<HTMLInputElement>(null);
+  const lock = useRef(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [email, setEmail] = useState("");
+  const [sentTo, setSentTo] = useState("");
+  const [codeSent, setCodeSent] = useState(false);
+
+  useEffect(() => {
+    if (codeSent) codeRef.current?.focus();
+  }, [codeSent]);
+
+  useEffect(() => {
+    if (!auth.ready || !auth.authenticated || demo.mode === "preview") return;
+    const next = sessionStorage.getItem("proofpay.next");
+    const destination = next && next.startsWith("/") && !next.startsWith("//") ? next : "/overview";
+    navigate(destination, { replace: true });
+  }, [auth.authenticated, auth.ready, demo.mode, navigate]);
+
+  async function sendCode(address: string, resend: boolean) {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const delivered = await auth.sendEmailCode(address);
+      setSentTo(delivered);
+      setCodeSent(true);
+      if (codeRef.current) codeRef.current.value = "";
+      setNotice(resend
+        ? `A new code is on its way to ${delivered}. The previous code no longer works.`
+        : `A 6-digit code is on its way to ${delivered}.`);
+    } catch (reason) {
+      setError(messageOf(reason, "The code could not be sent."));
+    } finally {
+      lock.current = false;
+      setBusy(false);
+    }
+  }
+
+  async function verifyCode(raw: string) {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      await auth.submitEmailCode(raw);
+    } catch (reason) {
+      lock.current = false;
+      setError(messageOf(reason, "Email sign-in did not finish."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <main className="min-h-dvh lg:grid lg:grid-cols-2">
       <a className="skip-link" href="#start">Skip to actions</a>
@@ -38,48 +99,90 @@ export function Welcome() {
         </ul>
       </section>
       <section id="start" className="flex flex-col justify-center px-5 py-6 sm:px-10 lg:px-14 lg:py-8">
-        <p className="text-sm font-extrabold text-blue-ink">A workspace, not a marketplace</p>
-        <h2 className="mt-2 text-2xl font-extrabold tracking-tight sm:text-3xl">See a funded week move from delivery to payment.</h2>
-        <p className="mt-3 max-w-md text-[15px] text-muted">Amara Cole sends a client a four-week agreement. The client funds one week at a time, reviews the activity report, and releases that payment. The next week stays visibly unfunded until they fund it.</p>
+        <h2 className="text-2xl font-extrabold tracking-tight sm:text-3xl">Sign in</h2>
+        <p className="mt-3 max-w-md text-[15px] text-muted">Google, X, email, or a wallet you already have. Signing in does not move funds or approve token spending.</p>
         <div className="mt-5 grid max-w-md gap-3">
-          <button
-            type="button"
-            className="btn btn-primary btn-lg"
-            disabled={busy}
-            onClick={() => {
-              if (demo.mode === "preview") {
-                enterMode("live", "/");
-                return;
-              }
-              setBusy(true);
-              setError("");
-              void demo.signIn().then(() => enterMode("live", "/overview")).catch((reason: unknown) => {
-                setBusy(false);
-                setError(reason instanceof Error ? reason.message : "Sign-in did not finish.");
-              });
-            }}
-          >
-            {busy ? "Check your wallet" : "Sign in with wallet"} <ArrowUpRight size={18} aria-hidden />
-          </button>
-          <button type="button" className="btn btn-ghost btn-lg" onClick={() => enterMode("preview", "/overview")}>Look at sample data</button>
-          <p className="text-sm text-muted">Sign this message to sign in. This does not move funds or approve token spending.</p>
-          {ethereum() ? null : <p className="text-sm text-muted">No wallet was found in this browser. On a phone, open ProofPay in your wallet’s browser, then sign in.</p>}
+          {demo.mode === "preview" ? (
+            <button type="button" className="btn btn-primary btn-lg" onClick={() => enterMode("live", "/")}>
+              Continue on testnet <ArrowUpRight size={18} aria-hidden />
+            </button>
+          ) : (
+            <>
+              <button type="button" className="btn btn-primary btn-lg" disabled={busy || !auth.ready} onClick={() => { setError(""); auth.continueGoogle(); }}>
+                Continue with Google <ArrowUpRight size={18} aria-hidden />
+              </button>
+              <button type="button" className="btn btn-ink btn-lg" disabled={busy || !auth.ready} onClick={() => { setError(""); auth.continueX(); }}>
+                Continue with X <ArrowUpRight size={18} aria-hidden />
+              </button>
+              {auth.authenticated ? (
+                <p className="text-sm font-bold" role="status">{auth.walletReady ? "You are signed in." : "Signed in. Preparing your wallet."}</p>
+              ) : codeSent ? (
+                <form className="grid gap-2" onSubmit={(event) => {
+                  event.preventDefault();
+                  void verifyCode(codeRef.current?.value ?? "");
+                }}>
+                  <p className="text-sm text-muted">Code sent to <span className="font-bold text-ink">{sentTo}</span></p>
+                  <label className="grid gap-1.5 text-sm font-bold">
+                    6-digit code
+                    <input
+                      ref={codeRef}
+                      className="control"
+                      name="code"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      spellCheck={false}
+                      aria-describedby="email-code-help"
+                      onInput={(event) => {
+                        const digits = event.currentTarget.value.replace(/\D/g, "").slice(0, 6);
+                        event.currentTarget.value = digits;
+                        if (digits.length === 6) void verifyCode(digits);
+                      }}
+                    />
+                  </label>
+                  <p id="email-code-help" className="text-sm text-muted">Use the newest email. Spaces and dashes are ignored.</p>
+                  <button type="submit" className="btn btn-ink btn-lg" disabled={busy || !auth.ready}>Verify email</button>
+                  <button type="button" className="btn btn-ghost" disabled={busy || !auth.ready} onClick={() => void sendCode(sentTo, true)}>Send a new code</button>
+                  <button type="button" className="btn btn-quiet" disabled={busy} onClick={() => { setCodeSent(false); setNotice(""); setError(""); }}>Use a different email</button>
+                </form>
+              ) : (
+                <form className="grid gap-2" onSubmit={(event) => {
+                  event.preventDefault();
+                  const typed = String(new FormData(event.currentTarget).get("email") ?? "");
+                  setEmail(typed);
+                  void sendCode(typed, false);
+                }}>
+                  <label className="grid gap-1.5 text-sm font-bold">
+                    Email
+                    <input className="control" type="email" name="email" autoComplete="email" defaultValue={email} required />
+                  </label>
+                  <button type="submit" className="btn btn-ink btn-lg" disabled={busy || !auth.ready}>Email me a code</button>
+                </form>
+              )}
+              <button
+                type="button"
+                className="btn btn-ghost btn-lg"
+                disabled={busy}
+                onClick={() => {
+                  setError("");
+                  if (auth.configured) {
+                    auth.connectWallet();
+                    return;
+                  }
+                  setBusy(true);
+                  void demo.signIn().then(() => enterMode("live", "/overview")).catch((reason: unknown) => {
+                    setBusy(false);
+                    setError(messageOf(reason, "Sign-in did not finish."));
+                  });
+                }}
+              >
+                Connect existing wallet
+              </button>
+            </>
+          )}
+          {notice ? <p className="text-sm text-muted" role="status">{notice}</p> : null}
+          {auth.error ? <p className="error-text" role="alert">{auth.error}</p> : null}
           {error ? <p className="error-text" role="alert">{error}</p> : null}
           {demo.profile ? <Link to="/overview" className="text-sm font-bold text-blue-ink">Open your workspace</Link> : null}
-        </div>
-        <div className="panel mt-5 max-w-md p-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <p className="text-sm font-bold text-muted">Product preview</p>
-              <p className="font-extrabold">Week 3 · Recap and report</p>
-              <p className="text-sm text-muted">Northline Labs · funds held · due 30 Sep</p>
-            </div>
-            <p className="font-extrabold tabular-nums">420.00</p>
-          </div>
-          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-line" aria-hidden>
-            <div className="h-full w-1/2 bg-ink" />
-          </div>
-          <p className="mt-2 text-sm text-muted">2 of 4 weeks paid. Week 4 is not secured.</p>
         </div>
       </section>
     </main>

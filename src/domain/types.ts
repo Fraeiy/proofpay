@@ -106,6 +106,12 @@ export type Agreement = {
   createdAt: string;
   milestones: Milestone[];
   draft: AgreementInput | null;
+  invitation?: {
+    expiresAt: string;
+    claimedWallet: string;
+    confirmed: boolean;
+    expired: boolean;
+  };
 };
 
 export type LedgerEntry = {

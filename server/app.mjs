@@ -4,6 +4,7 @@ import { getAddress, isAddress, verifyMessage } from "viem";
 import { centsToBaseUnits, checksum, hashTerms, sameAddress, SIGN_IN_STATEMENT, submissionRef } from "../shared/protocol.mjs";
 import { makePublicClient, overlayChain, reconcileTransaction } from "./chain.mjs";
 import { openDatabase } from "./db.mjs";
+import { privyConfigured, verifyPrivyAccessToken } from "./privy.mjs";
 import { buildReceiptPdf } from "./receipt.mjs";
 
 const PHASES = new Set(["unfunded", "funded", "submitted", "changes_requested", "paid", "refunded"]);
@@ -132,13 +133,35 @@ export function createApp(options = {}) {
     return null;
   }
 
+  function ownedWallets(profile) {
+    const primary = String(profile.wallet || "").toLowerCase();
+    const links = profile.privy_user_id
+      ? db.prepare("SELECT wallet FROM wallet_links WHERE privy_user_id = ?").all(profile.privy_user_id).map((item) => String(item.wallet).toLowerCase())
+      : [];
+    return [...new Set([primary, ...links].filter(Boolean))];
+  }
+
+  function presentUser(profile, activeWallet) {
+    const wallets = ownedWallets(profile);
+    const active = String(activeWallet || "").toLowerCase();
+    if (!wallets.includes(active)) return null;
+    return { ...profile, wallet: active, profile_wallet: profile.wallet, wallets };
+  }
+
   function sessionUser(req) {
     const token = readCookie(req.headers.cookie, "proofpay_session");
     if (!token) return null;
-    const row = db.prepare("SELECT sessions.expires_at, users.* FROM sessions JOIN users ON users.wallet = sessions.wallet WHERE sessions.token_hash = ?").get(sha256(token));
-    if (!row) return null;
-    if (new Date(row.expires_at).getTime() <= now().getTime()) return { expired: true };
-    return row;
+    const session = db.prepare("SELECT * FROM sessions WHERE token_hash = ?").get(sha256(token));
+    if (!session) return null;
+    if (new Date(session.expires_at).getTime() <= now().getTime()) return { expired: true };
+    const link = db.prepare("SELECT privy_user_id FROM wallet_links WHERE wallet = ?").get(session.wallet);
+    let profile = link ? db.prepare("SELECT * FROM users WHERE privy_user_id = ?").get(link.privy_user_id) : null;
+    if (!profile) profile = db.prepare("SELECT * FROM users WHERE wallet = ?").get(session.wallet);
+    if (!profile) return null;
+    const user = presentUser(profile, session.wallet);
+    if (!user) return null;
+    user.session_token_hash = sha256(token);
+    return user;
   }
 
   function send(res, status, body, extra = {}) {
@@ -158,14 +181,25 @@ export function createApp(options = {}) {
   }
 
   function publicUser(row) {
+    const wallets = (row.wallets ?? [row.wallet]).map((wallet) => getAddress(wallet));
     return {
       wallet: getAddress(row.wallet),
+      wallets,
       displayName: row.display_name,
       intent: row.intent,
       preferredView: row.preferred_view,
       theme: row.theme,
       onboarded: row.onboarded === 1,
     };
+  }
+
+  function holdsWallet(user, wallet) {
+    if (!wallet) return false;
+    return (user.wallets ?? [user.wallet]).some((item) => sameAddress(item, wallet));
+  }
+
+  function partyWallet(value) {
+    return value && isAddress(value) ? getAddress(value) : "";
   }
 
   function requireUser(req, res) {
@@ -194,9 +228,14 @@ export function createApp(options = {}) {
   }
 
   function canSee(user, agreement) {
-    if (!agreement || !user) return false;
-    if (sameAddress(agreement.freelancer_wallet, user.wallet)) return true;
-    return sameAddress(agreement.client_wallet, user.wallet) && agreement.status !== "draft";
+    if (!agreement || !user || user.expired) return false;
+    if (holdsWallet(user, agreement.freelancer_wallet)) return true;
+    if (agreement.client_wallet && holdsWallet(user, agreement.client_wallet) && agreement.status !== "draft") return true;
+    if (agreement.status === "draft") {
+      const invite = db.prepare("SELECT claimed_wallet, confirmed_at FROM invitations WHERE agreement_id = ? AND claimed_wallet IS NOT NULL").get(agreement.id);
+      if (invite && !invite.confirmed_at && holdsWallet(user, invite.claimed_wallet)) return true;
+    }
+    return false;
   }
 
   function loadAgreement(user, id, res) {
@@ -255,7 +294,7 @@ export function createApp(options = {}) {
       ? {
           title: row.title,
           clientName: row.client_name,
-          clientWallet: getAddress(row.client_wallet),
+          clientWallet: partyWallet(row.client_wallet),
           description: row.description,
           milestones: milestones.map((milestone) => ({
             id: milestone.id,
@@ -267,14 +306,23 @@ export function createApp(options = {}) {
         }
       : null;
     const freelancer = db.prepare("SELECT display_name FROM users WHERE wallet = ?").get(row.freelancer_wallet);
-    const clientUser = db.prepare("SELECT display_name FROM users WHERE wallet = ?").get(row.client_wallet);
+    const clientUser = row.client_wallet ? db.prepare("SELECT display_name FROM users WHERE wallet = ?").get(row.client_wallet) : null;
+    const invitation = db.prepare("SELECT expires_at, claimed_wallet, confirmed_at FROM invitations WHERE agreement_id = ? ORDER BY created_at DESC").get(row.id);
     return {
       id: row.id,
       title: row.title,
       description: row.description,
       status: row.status === "cancelled" && row.replaced_by ? "cancelled" : row.status,
       freelancer: { name: freelancer?.display_name || "Freelancer", role: "freelancer", wallet: getAddress(row.freelancer_wallet) },
-      client: { name: clientUser?.display_name || row.client_name, role: "client", wallet: getAddress(row.client_wallet) },
+      client: { name: clientUser?.display_name || row.client_name, role: "client", wallet: partyWallet(row.client_wallet) },
+      invitation: invitation
+        ? {
+            expiresAt: invitation.expires_at,
+            claimedWallet: partyWallet(invitation.claimed_wallet),
+            confirmed: Boolean(invitation.confirmed_at),
+            expired: new Date(invitation.expires_at).getTime() <= now().getTime(),
+          }
+        : undefined,
       termsRef: row.terms_hash || "draft",
       chainAgreementId: row.chain_agreement_id ?? undefined,
       freelancerAcceptedAt: row.freelancer_accepted_at ?? undefined,
@@ -313,11 +361,22 @@ export function createApp(options = {}) {
   }
 
   function visibleAgreements(user) {
-    return db.prepare(`
+    const wallets = user.wallets ?? [user.wallet];
+    const marks = wallets.map(() => "?").join(",");
+    const rows = db.prepare(`
       SELECT * FROM agreements
-      WHERE freelancer_wallet = ? OR (client_wallet = ? AND status != 'draft')
+      WHERE freelancer_wallet IN (${marks}) OR (client_wallet IN (${marks}) AND status != 'draft')
       ORDER BY updated_at DESC
-    `).all(user.wallet, user.wallet);
+    `).all(...wallets, ...wallets);
+    const claimed = db.prepare(`
+      SELECT agreement_id FROM invitations
+      WHERE claimed_wallet IN (${marks}) AND confirmed_at IS NULL
+    `).all(...wallets).map((item) => item.agreement_id);
+    const seen = new Set(rows.map((item) => item.id));
+    const extras = claimed.filter((id) => !seen.has(id));
+    if (extras.length === 0) return rows;
+    const more = db.prepare(`SELECT * FROM agreements WHERE id IN (${extras.map(() => "?").join(",")}) AND status = 'draft'`).all(...extras);
+    return [...rows, ...more];
   }
 
   async function syncChain() {
@@ -357,16 +416,18 @@ export function createApp(options = {}) {
     void result;
   }
 
-  function validateForm(user, form) {
+  function validateForm(user, form, { requireClient = true } = {}) {
     const errors = {};
     const title = String(form?.title ?? "").trim();
     const clientName = String(form?.clientName ?? "").trim();
     const description = String(form?.description ?? "").trim();
-    const clientWallet = checksum(String(form?.clientWallet ?? "").trim());
+    const rawWallet = String(form?.clientWallet ?? "").trim();
+    const clientWallet = rawWallet ? checksum(rawWallet) : null;
     if (title.length < 3 || title.length > 80) errors.title = "Give the agreement a title, 3 to 80 characters.";
     if (clientName.length < 2 || clientName.length > 60) errors.clientName = "Add the client’s name, 2 to 60 characters.";
-    if (!clientWallet) errors.clientWallet = "Enter the client’s wallet address.";
-    else if (sameAddress(clientWallet, user.wallet)) errors.clientWallet = "Use a different wallet for the client. One person cannot be both sides of this agreement.";
+    if (!rawWallet && requireClient) errors.clientWallet = "Enter the client’s wallet address.";
+    else if (rawWallet && !clientWallet) errors.clientWallet = "Enter the client’s wallet address.";
+    else if (clientWallet && holdsWallet(user, clientWallet)) errors.clientWallet = "Use a different wallet for the client. One person cannot be both sides of this agreement.";
     if (description.length < 20 || description.length > 600) errors.description = "Describe the work in 20 to 600 characters.";
     const milestones = Array.isArray(form?.milestones) ? form.milestones : [];
     if (milestones.length < 1 || milestones.length > 8) errors.milestones = "Add between 1 and 8 milestones.";
@@ -423,7 +484,7 @@ export function createApp(options = {}) {
       res.setHeader("access-control-allow-origin", origin);
       res.setHeader("vary", "Origin");
       res.setHeader("access-control-allow-credentials", "true");
-      res.setHeader("access-control-allow-headers", "content-type, x-proofpay-request");
+      res.setHeader("access-control-allow-headers", "content-type, x-proofpay-request, authorization");
       res.setHeader("access-control-allow-methods", "GET, POST, PATCH, DELETE, OPTIONS");
     }
     if (req.method === "OPTIONS") {
@@ -450,6 +511,9 @@ export function createApp(options = {}) {
           nativeSymbol: "MON",
           configured: Boolean(chain.escrow && chain.token),
           testnet: true,
+          privy: privyConfigured(),
+          privyAppId: process.env.VITE_PRIVY_APP_ID || process.env.PRIVY_APP_ID || null,
+          faucetUrl: "https://faucet.monad.xyz",
         });
         return;
       }
@@ -537,7 +601,87 @@ export function createApp(options = {}) {
         const expires = new Date(now().getTime() + sessionMs).toISOString();
         db.prepare("INSERT INTO sessions (id, wallet, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)").run(randomUUID(), row.wallet, sha256(token), expires, now().toISOString());
         const user = db.prepare("SELECT * FROM users WHERE wallet = ?").get(row.wallet);
-        send(res, 200, { user: publicUser(user) }, { "set-cookie": cookie(token, Math.floor(sessionMs / 1000)) });
+        send(res, 200, { user: publicUser(presentUser(user, user.wallet)) }, { "set-cookie": cookie(token, Math.floor(sessionMs / 1000)) });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/auth/privy") {
+        if (!guardWrite(req, res)) return;
+        const ip = req.socket.remoteAddress ?? "local";
+        if (!limited(`privy:${ip}`)) {
+          send(res, 429, { error: "Too many sign-in attempts. Wait a few minutes and try again." });
+          return;
+        }
+        const header = String(req.headers.authorization ?? "");
+        const accessToken = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+        const body = await readBody(req);
+        let identity;
+        try {
+          identity = await verifyPrivyAccessToken(accessToken);
+        } catch (error) {
+          const status = error?.status || 401;
+          send(res, status, { error: error?.message || "This sign-in could not be verified. Try again." });
+          return;
+        }
+        if (identity.wallets.length === 0) {
+          send(res, 200, { pendingWallet: true, user: null });
+          return;
+        }
+        const requested = body.activeWallet ? checksum(String(body.activeWallet)) : null;
+        if (body.activeWallet && !requested) {
+          send(res, 400, { error: "Choose one of your verified wallets." });
+          return;
+        }
+        const conflicts = [];
+        const usable = [];
+        for (const wallet of identity.wallets) {
+          const existing = db.prepare("SELECT * FROM users WHERE wallet = ?").get(wallet.address);
+          if (existing?.privy_user_id && existing.privy_user_id !== identity.userId) {
+            conflicts.push(getAddress(wallet.address));
+            continue;
+          }
+          usable.push(wallet);
+        }
+        if (usable.length === 0) {
+          send(res, 409, { error: "These wallets are already linked to a different ProofPay account." });
+          return;
+        }
+        if (requested && !usable.some((wallet) => sameAddress(wallet.address, requested))) {
+          send(res, 403, { error: "Connect and verify that wallet before using it." });
+          return;
+        }
+        let profile = db.prepare("SELECT * FROM users WHERE privy_user_id = ?").get(identity.userId);
+        if (!profile) {
+          const existing = usable.map((wallet) => db.prepare("SELECT * FROM users WHERE wallet = ?").get(wallet.address)).find(Boolean);
+          if (existing) {
+            const attached = db.prepare("UPDATE users SET privy_user_id = ?, updated_at = ? WHERE wallet = ? AND (privy_user_id IS NULL OR privy_user_id = ?)").run(identity.userId, now().toISOString(), existing.wallet, identity.userId);
+            if (Number(attached.changes) !== 1) {
+              send(res, 409, { error: "This wallet is already linked to a different ProofPay account." });
+              return;
+            }
+            profile = db.prepare("SELECT * FROM users WHERE wallet = ?").get(existing.wallet);
+          } else {
+            const preferred = usable.find((wallet) => wallet.kind === "embedded") ?? usable[0];
+            const at = now().toISOString();
+            db.prepare(`
+              INSERT INTO users (wallet, display_name, intent, preferred_view, theme, onboarded, created_at, updated_at, privy_user_id)
+              VALUES (?, ?, 'both', 'freelancer', 'system', 0, ?, ?, ?)
+            `).run(preferred.address, shortWallet(getAddress(preferred.address)), at, at, identity.userId);
+            profile = db.prepare("SELECT * FROM users WHERE wallet = ?").get(preferred.address);
+          }
+        }
+        const linkWallet = db.prepare(`
+          INSERT INTO wallet_links (privy_user_id, wallet, kind, created_at) VALUES (?, ?, ?, ?)
+          ON CONFLICT(privy_user_id, wallet) DO UPDATE SET kind = excluded.kind
+        `);
+        for (const wallet of usable) linkWallet.run(identity.userId, wallet.address, wallet.kind, now().toISOString());
+        const active = (requested ? requested.toLowerCase() : null)
+          ?? usable.find((wallet) => wallet.kind === "embedded")?.address
+          ?? profile.wallet;
+        const token = randomBytes(32).toString("hex");
+        const expires = new Date(now().getTime() + sessionMs).toISOString();
+        db.prepare("INSERT INTO sessions (id, wallet, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)").run(randomUUID(), active, sha256(token), expires, now().toISOString());
+        const user = presentUser(db.prepare("SELECT * FROM users WHERE wallet = ?").get(profile.wallet), active);
+        send(res, 200, { pendingWallet: false, user: publicUser(user), unlinked: conflicts }, { "set-cookie": cookie(token, Math.floor(sessionMs / 1000)) });
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/auth/logout") {
@@ -586,8 +730,19 @@ export function createApp(options = {}) {
           send(res, 400, { error: "Choose light, dark, or system." });
           return;
         }
-        db.prepare("UPDATE users SET display_name = ?, intent = ?, preferred_view = ?, theme = ?, onboarded = ?, updated_at = ? WHERE wallet = ?").run(displayName, intent, preferredView, theme, onboarded, now().toISOString(), user.wallet);
-        send(res, 200, { user: publicUser(db.prepare("SELECT * FROM users WHERE wallet = ?").get(user.wallet)) });
+        let active = user.wallet;
+        if (body.activeWallet) {
+          const next = checksum(String(body.activeWallet));
+          if (!next || !holdsWallet(user, next)) {
+            send(res, 403, { error: "Connect and verify that wallet before using it." });
+            return;
+          }
+          active = next.toLowerCase();
+          db.prepare("UPDATE sessions SET wallet = ? WHERE token_hash = ?").run(active, user.session_token_hash);
+        }
+        db.prepare("UPDATE users SET display_name = ?, intent = ?, preferred_view = ?, theme = ?, onboarded = ?, updated_at = ? WHERE wallet = ?").run(displayName, intent, preferredView, theme, onboarded, now().toISOString(), user.profile_wallet);
+        const updated = presentUser(db.prepare("SELECT * FROM users WHERE wallet = ?").get(user.profile_wallet), active);
+        send(res, 200, { user: publicUser(updated) });
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/workspace") {
@@ -603,7 +758,24 @@ export function createApp(options = {}) {
         const ledger = ids.length
           ? db.prepare(`SELECT * FROM ledger WHERE agreement_id IN (${ids.map(() => "?").join(",")}) ORDER BY created_at DESC`).all(...ids).map(mapLedger)
           : [];
-        send(res, 200, { user: publicUser(user), agreements, ledger, chainSync, chain });
+        const attemptMarks = (user.wallets?.length ? user.wallets : [user.wallet]).map((wallet) => wallet.toLowerCase());
+        const attempts = db.prepare(`
+          SELECT tx_hash, purpose, agreement_id, milestone_id, status, detail, updated_at
+          FROM tx_attempts
+          WHERE lower(wallet) IN (${attemptMarks.map(() => "?").join(",")})
+            AND tx_hash IS NOT NULL
+            AND status IN ('submitted', 'pending', 'unknown')
+          ORDER BY updated_at DESC
+          LIMIT 8
+        `).all(...attemptMarks).map((row) => ({
+          txHash: row.tx_hash,
+          purpose: row.purpose,
+          agreementId: row.agreement_id,
+          milestoneId: row.milestone_id,
+          status: row.status,
+          detail: row.detail,
+        }));
+        send(res, 200, { user: publicUser(user), agreements, ledger, attempts, chainSync, chain });
         return;
       }
 
@@ -625,12 +797,13 @@ export function createApp(options = {}) {
         const user = requireUser(req, res);
         if (!user) return;
         const body = await readBody(req);
-        const parsed = validateForm(user, body);
+        const inviting = body.invite === true && !String(body.clientWallet ?? "").trim();
+        const parsed = validateForm(user, body, { requireClient: !inviting });
         if (Object.keys(parsed.errors).length > 0 && body.strict) {
           send(res, 400, { error: "Check the agreement fields.", errors: parsed.errors });
           return;
         }
-        if (!parsed.title || !parsed.clientWallet) {
+        if (!parsed.title || (!inviting && !parsed.clientWallet)) {
           send(res, 400, { error: "Add a title and the client wallet before saving.", errors: parsed.errors });
           return;
         }
@@ -640,7 +813,7 @@ export function createApp(options = {}) {
           INSERT INTO agreements (
             id, title, description, status, freelancer_wallet, client_wallet, client_name, terms_json, version, created_at, updated_at
           ) VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, 1, ?, ?)
-        `).run(id, parsed.title, parsed.description, user.wallet, parsed.clientWallet.toLowerCase(), parsed.clientName, JSON.stringify(body), at, at);
+        `).run(id, parsed.title, parsed.description, user.wallet, parsed.clientWallet ? parsed.clientWallet.toLowerCase() : "", parsed.clientName, JSON.stringify(body), at, at);
         if (parsed.milestones.length) replaceMilestones(id, parsed.milestones);
         send(res, 200, { agreement: mapAgreement(agreementFor(id)) });
         return;
@@ -656,15 +829,21 @@ export function createApp(options = {}) {
           return;
         }
         const body = await readBody(req);
-        const parsed = validateForm(user, body);
-        if (!parsed.title || !parsed.clientWallet) {
+        const inviting = !String(body.clientWallet ?? "").trim();
+        const parsed = validateForm(user, body, { requireClient: !inviting });
+        if (!parsed.title || (!inviting && !parsed.clientWallet)) {
           send(res, 400, { error: "Add a title and the client wallet before saving.", errors: parsed.errors });
           return;
+        }
+        const clientStored = parsed.clientWallet ? parsed.clientWallet.toLowerCase() : "";
+        const openInvite = db.prepare("SELECT * FROM invitations WHERE agreement_id = ?").get(agreement.id);
+        if (openInvite?.confirmed_at && clientStored !== String(openInvite.claimed_wallet || "").toLowerCase()) {
+          db.prepare("UPDATE invitations SET confirmed_at = NULL WHERE id = ?").run(openInvite.id);
         }
         db.prepare(`
           UPDATE agreements SET title = ?, description = ?, client_wallet = ?, client_name = ?, terms_json = ?, terms_hash = NULL, version = version + 1, updated_at = ?
           WHERE id = ?
-        `).run(parsed.title, parsed.description, parsed.clientWallet.toLowerCase(), parsed.clientName, JSON.stringify(body), now().toISOString(), agreement.id);
+        `).run(parsed.title, parsed.description, clientStored, parsed.clientName, JSON.stringify(body), now().toISOString(), agreement.id);
         replaceMilestones(agreement.id, parsed.milestones);
         send(res, 200, { agreement: mapAgreement(agreementFor(agreement.id)) });
         return;
@@ -721,6 +900,197 @@ export function createApp(options = {}) {
         return;
       }
 
+      const inviteCreate = url.pathname.match(/^\/api\/agreements\/([^/]+)\/invitation$/);
+      if (inviteCreate && req.method === "POST") {
+        if (!guardWrite(req, res)) return;
+        const ip = req.socket.remoteAddress ?? "local";
+        if (!limited(`invite:${ip}`)) {
+          send(res, 429, { error: "Too many invitation attempts. Wait a few minutes and try again." });
+          return;
+        }
+        const user = requireUser(req, res);
+        if (!user) return;
+        const agreement = loadAgreement(user, inviteCreate[1], res);
+        if (!agreement) return;
+        if (!sameAddress(agreement.freelancer_wallet, user.wallet) || agreement.status !== "draft") {
+          send(res, 403, { error: "Only the freelancer can invite a client to a draft." });
+          return;
+        }
+        const existing = db.prepare("SELECT * FROM invitations WHERE agreement_id = ?").get(agreement.id);
+        if (existing?.confirmed_at) {
+          send(res, 409, { error: "The client wallet is already confirmed." });
+          return;
+        }
+        if (existing && new Date(existing.expires_at).getTime() > now().getTime()) {
+          send(res, 409, { error: "An invitation is already open. Cancel it before creating another." });
+          return;
+        }
+        if (existing) db.prepare("DELETE FROM invitations WHERE id = ?").run(existing.id);
+        const token = randomBytes(32).toString("hex");
+        const expires = new Date(now().getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        db.prepare(`
+          INSERT INTO invitations (id, agreement_id, token_hash, expires_at, claimed_wallet, confirmed_at, created_at)
+          VALUES (?, ?, ?, ?, NULL, NULL, ?)
+        `).run(randomUUID(), agreement.id, sha256(token), expires, now().toISOString());
+        send(res, 200, { token, expiresAt: expires, path: `/invite/${token}` });
+        return;
+      }
+      if (inviteCreate && req.method === "DELETE") {
+        if (!guardWrite(req, res)) return;
+        const user = requireUser(req, res);
+        if (!user) return;
+        const agreement = loadAgreement(user, inviteCreate[1], res);
+        if (!agreement) return;
+        if (!sameAddress(agreement.freelancer_wallet, user.wallet) || agreement.status !== "draft") {
+          send(res, 403, { error: "Only the freelancer can cancel an invitation on a draft." });
+          return;
+        }
+        const existing = db.prepare("SELECT * FROM invitations WHERE agreement_id = ?").get(agreement.id);
+        if (existing?.confirmed_at) {
+          send(res, 409, { error: "The client wallet is already confirmed." });
+          return;
+        }
+        if (existing) db.prepare("DELETE FROM invitations WHERE id = ?").run(existing.id);
+        send(res, 200, { ok: true });
+        return;
+      }
+
+      const confirmClient = url.pathname.match(/^\/api\/agreements\/([^/]+)\/confirm-client$/);
+      if (confirmClient && req.method === "POST") {
+        if (!guardWrite(req, res)) return;
+        const user = requireUser(req, res);
+        if (!user) return;
+        const agreement = loadAgreement(user, confirmClient[1], res);
+        if (!agreement) return;
+        if (!sameAddress(agreement.freelancer_wallet, user.wallet) || agreement.status !== "draft") {
+          send(res, 403, { error: "Only the freelancer can confirm the client on a draft." });
+          return;
+        }
+        const invite = db.prepare("SELECT * FROM invitations WHERE agreement_id = ?").get(agreement.id);
+        if (!invite?.claimed_wallet) {
+          send(res, 409, { error: "Nobody has claimed this invitation yet." });
+          return;
+        }
+        if (new Date(invite.expires_at).getTime() <= now().getTime()) {
+          send(res, 410, { error: "This invitation expired. Create a new link." });
+          return;
+        }
+        if (agreement.client_wallet && !sameAddress(agreement.client_wallet, invite.claimed_wallet)) {
+          send(res, 409, { error: "This agreement already names a different client wallet." });
+          return;
+        }
+        const at = now().toISOString();
+        db.prepare("UPDATE agreements SET client_wallet = ?, updated_at = ? WHERE id = ?").run(invite.claimed_wallet, at, agreement.id);
+        db.prepare("UPDATE invitations SET confirmed_at = ? WHERE id = ?").run(at, invite.id);
+        const terms = JSON.parse(agreement.terms_json);
+        terms.clientWallet = getAddress(invite.claimed_wallet);
+        db.prepare("UPDATE agreements SET terms_json = ? WHERE id = ?").run(JSON.stringify(terms), agreement.id);
+        send(res, 200, { agreement: mapAgreement(agreementFor(agreement.id)) });
+        return;
+      }
+
+      const declineClient = url.pathname.match(/^\/api\/agreements\/([^/]+)\/decline-client$/);
+      if (declineClient && req.method === "POST") {
+        if (!guardWrite(req, res)) return;
+        const user = requireUser(req, res);
+        if (!user) return;
+        const agreement = loadAgreement(user, declineClient[1], res);
+        if (!agreement) return;
+        if (!sameAddress(agreement.freelancer_wallet, user.wallet) || agreement.status !== "draft") {
+          send(res, 403, { error: "Only the freelancer can decline a claimed invitation." });
+          return;
+        }
+        const invite = db.prepare("SELECT * FROM invitations WHERE agreement_id = ?").get(agreement.id);
+        if (invite?.confirmed_at) {
+          send(res, 409, { error: "The client wallet is already confirmed." });
+          return;
+        }
+        if (invite) db.prepare("UPDATE invitations SET claimed_wallet = NULL WHERE id = ?").run(invite.id);
+        send(res, 200, { ok: true });
+        return;
+      }
+
+      const invitePreview = url.pathname.match(/^\/api\/invitations\/([a-f0-9]{64})$/);
+      if (invitePreview && req.method === "GET") {
+        if (req.headers["x-proofpay-request"] !== "1") {
+          send(res, 403, { error: "This request did not come from the ProofPay site." });
+          return;
+        }
+        const ip = req.socket.remoteAddress ?? "local";
+        if (!limited(`preview:${ip}`)) {
+          send(res, 429, { error: "Too many invitation attempts. Wait a few minutes and try again." });
+          return;
+        }
+        const row = db.prepare(`
+          SELECT invitations.*, agreements.title, agreements.freelancer_wallet, agreements.status AS agreement_status
+          FROM invitations JOIN agreements ON agreements.id = invitations.agreement_id
+          WHERE invitations.token_hash = ?
+        `).get(sha256(invitePreview[1]));
+        if (!row || row.agreement_status !== "draft") {
+          send(res, 404, { error: "This invitation is not available." });
+          return;
+        }
+        const freelancer = db.prepare("SELECT display_name FROM users WHERE wallet = ?").get(row.freelancer_wallet);
+        const expired = new Date(row.expires_at).getTime() <= now().getTime();
+        const status = expired ? "expired" : row.confirmed_at ? "confirmed" : row.claimed_wallet ? "claimed" : "open";
+        send(res, 200, {
+          title: row.title,
+          freelancerName: freelancer?.display_name || "Freelancer",
+          expiresAt: row.expires_at,
+          status,
+        });
+        return;
+      }
+
+      const inviteClaim = url.pathname.match(/^\/api\/invitations\/([a-f0-9]{64})\/claim$/);
+      if (inviteClaim && req.method === "POST") {
+        if (!guardWrite(req, res)) return;
+        const ip = req.socket.remoteAddress ?? "local";
+        if (!limited(`claim:${ip}`)) {
+          send(res, 429, { error: "Too many invitation attempts. Wait a few minutes and try again." });
+          return;
+        }
+        const user = requireUser(req, res);
+        if (!user) return;
+        const row = db.prepare(`
+          SELECT invitations.*, agreements.freelancer_wallet, agreements.status AS agreement_status
+          FROM invitations JOIN agreements ON agreements.id = invitations.agreement_id
+          WHERE invitations.token_hash = ?
+        `).get(sha256(inviteClaim[1]));
+        if (!row || row.agreement_status !== "draft") {
+          send(res, 404, { error: "This invitation is not available." });
+          return;
+        }
+        if (new Date(row.expires_at).getTime() <= now().getTime()) {
+          send(res, 410, { error: "This invitation expired. Ask the freelancer for a new link." });
+          return;
+        }
+        if (holdsWallet(user, row.freelancer_wallet)) {
+          send(res, 403, { error: "The freelancer cannot claim their own invitation." });
+          return;
+        }
+        if (row.confirmed_at) {
+          send(res, 409, { error: "This invitation is already confirmed." });
+          return;
+        }
+        if (row.claimed_wallet && !sameAddress(row.claimed_wallet, user.wallet)) {
+          send(res, 409, { error: "Someone else already claimed this invitation. The freelancer has to confirm that wallet." });
+          return;
+        }
+        if (!row.claimed_wallet) {
+          const claimed = db.prepare("UPDATE invitations SET claimed_wallet = ? WHERE id = ? AND claimed_wallet IS NULL").run(user.wallet, row.id);
+          if (Number(claimed.changes) !== 1) {
+            const latest = db.prepare("SELECT claimed_wallet FROM invitations WHERE id = ?").get(row.id);
+            if (!latest || !sameAddress(latest.claimed_wallet, user.wallet)) {
+              send(res, 409, { error: "Someone else already claimed this invitation. The freelancer has to confirm that wallet." });
+              return;
+            }
+          }
+        }
+        send(res, 200, { agreementId: row.agreement_id, status: "claimed" });
+        return;
+      }
+
       const commit = url.pathname.match(/^\/api\/agreements\/([^/]+)\/commit$/);
       if (commit && req.method === "POST") {
         if (!guardWrite(req, res)) return;
@@ -732,14 +1102,19 @@ export function createApp(options = {}) {
           send(res, 403, { error: "Only the freelancer can commit a draft." });
           return;
         }
-        if (!chain.escrow) {
-          send(res, 503, { error: "The escrow contract is not configured on this server yet. No agreement was committed." });
+        const form = JSON.parse(agreement.terms_json);
+        const parsed = validateForm(user, form, { requireClient: false });
+        const invite = db.prepare("SELECT * FROM invitations WHERE agreement_id = ?").get(agreement.id);
+        if (invite && (!invite.confirmed_at || !parsed.clientWallet || String(invite.claimed_wallet || "").toLowerCase() !== parsed.clientWallet.toLowerCase())) {
+          send(res, 409, { error: "Confirm the client who claimed this invitation before sharing. The link alone does not bind them." });
           return;
         }
-        const form = JSON.parse(agreement.terms_json);
-        const parsed = validateForm(user, form);
-        if (Object.keys(parsed.errors).length > 0) {
-          send(res, 400, { error: "Finish the agreement before sharing it.", errors: parsed.errors });
+        if (Object.keys(parsed.errors).length > 0 || !parsed.clientWallet) {
+          send(res, 400, { error: "Finish the agreement and confirm the client wallet before sharing it.", errors: parsed.errors });
+          return;
+        }
+        if (!chain.escrow) {
+          send(res, 503, { error: "The escrow contract is not configured on this server yet. No agreement was committed." });
           return;
         }
         const termsHash = hashTerms({
@@ -966,6 +1341,39 @@ export function createApp(options = {}) {
       }
 
       const receipt = url.pathname.match(/^\/api\/receipts\/([^/]+)\.pdf$/);
+      if (receipt && req.method === "GET" && receipt[1] === "sample") {
+        if (req.headers["x-proofpay-request"] !== "1") {
+          send(res, 403, { error: "This request did not come from the ProofPay site." });
+          return;
+        }
+        const bytes = await buildReceiptPdf({
+          sample: true,
+          heading: "Simulated receipt",
+          status: "Simulated",
+          amountLabel: "420.00 tUSDC",
+          reference: "sample-not-a-transaction",
+          agreementTitle: "Sample agreement",
+          agreementRef: "sample",
+          milestoneTitle: "Sample milestone",
+          fromName: "Sample client",
+          fromWallet: "0x0000000000000000000000000000000000000001",
+          toName: "Sample freelancer",
+          toWallet: "0x0000000000000000000000000000000000000002",
+          token: "tUSDC · simulated · no monetary value",
+          network: "Sample layout · not a network",
+          confirmedAt: "Not a confirmed transaction",
+          txHash: "None. This sample has no transaction hash.",
+          explorerUrl: "",
+          note: "SIMULATED RECEIPT. This file is not a Monad payment.",
+        });
+        res.writeHead(200, {
+          "content-type": "application/pdf",
+          "content-disposition": "attachment; filename=\"proofpay-simulated-receipt.pdf\"",
+          "cache-control": "no-store",
+        });
+        res.end(Buffer.from(bytes));
+        return;
+      }
       if (receipt && req.method === "GET") {
         if (req.headers["x-proofpay-request"] !== "1") {
           send(res, 403, { error: "This request did not come from the ProofPay site." });

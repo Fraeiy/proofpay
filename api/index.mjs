@@ -1,6 +1,6 @@
 import { createApp } from "../server/app.mjs";
 
-const origins = (process.env.PROOFPAY_ORIGINS || "http://127.0.0.1:5174,http://localhost:5174")
+const origins = (process.env.PROOFPAY_ORIGINS || "http://127.0.0.1:5174,http://localhost:5174,https://proofpay-pi.vercel.app")
   .split(",")
   .map((item) => item.trim())
   .filter(Boolean);

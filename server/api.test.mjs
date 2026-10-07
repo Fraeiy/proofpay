@@ -316,3 +316,116 @@ test("an unverified hash is not a payment, and a receipt stays private", async (
     await app.close();
   }
 });
+
+test("invitation claim is single-use and does not grant funding", async () => {
+  const { app, base } = await boot();
+  const freelancer = account();
+  const client = account();
+  const stranger = account();
+  const freelancerSession = await signIn(base, freelancer);
+  const created = await fetch(`${base}/api/agreements`, {
+    method: "POST",
+    headers: headers(freelancerSession.cookie),
+    body: JSON.stringify({ ...draft(client.address), clientWallet: "", invite: true }),
+  });
+  const createdBody = await created.json();
+  assert.equal(created.status, 200, createdBody.error);
+  assert.equal(createdBody.agreement.client.wallet, "");
+
+  const invited = await fetch(`${base}/api/agreements/${createdBody.agreement.id}/invitation`, {
+    method: "POST",
+    headers: headers(freelancerSession.cookie),
+    body: "{}",
+  });
+  const invitation = await invited.json();
+  assert.equal(invited.status, 200, invitation.error);
+  assert.match(invitation.token, /^[a-f0-9]{64}$/);
+
+  const preview = await fetch(`${base}/api/invitations/${invitation.token}`, { headers: headers() });
+  const previewBody = await preview.json();
+  assert.equal(preview.status, 200);
+  assert.equal(previewBody.status, "open");
+  assert.equal(previewBody.clientWallet, undefined);
+  assert.equal(JSON.stringify(previewBody).includes(client.address.toLowerCase()), false);
+
+  const strangerSession = await signIn(base, stranger);
+  const hidden = await fetch(`${base}/api/agreements/${createdBody.agreement.id}`, { headers: headers(strangerSession.cookie) });
+  assert.equal(hidden.status, 404);
+
+  const clientSession = await signIn(base, client);
+  const claimed = await fetch(`${base}/api/invitations/${invitation.token}/claim`, {
+    method: "POST",
+    headers: headers(clientSession.cookie),
+    body: "{}",
+  });
+  assert.equal(claimed.status, 200);
+  const again = await fetch(`${base}/api/invitations/${invitation.token}/claim`, {
+    method: "POST",
+    headers: headers(strangerSession.cookie),
+    body: "{}",
+  });
+  assert.equal(again.status, 409);
+
+  const seen = await fetch(`${base}/api/agreements/${createdBody.agreement.id}`, { headers: headers(clientSession.cookie) });
+  const seenBody = await seen.json();
+  assert.equal(seen.status, 200);
+  assert.equal(seenBody.agreement.invitation.confirmed, false);
+  const stillHidden = await fetch(`${base}/api/agreements/${createdBody.agreement.id}`, { headers: headers(strangerSession.cookie) });
+  assert.equal(stillHidden.status, 404);
+
+  const early = await fetch(`${base}/api/agreements/${createdBody.agreement.id}/commit`, {
+    method: "POST",
+    headers: headers(freelancerSession.cookie),
+    body: "{}",
+  });
+  assert.equal(early.status, 409);
+
+  const confirmed = await fetch(`${base}/api/agreements/${createdBody.agreement.id}/confirm-client`, {
+    method: "POST",
+    headers: headers(freelancerSession.cookie),
+    body: "{}",
+  });
+  const confirmedBody = await confirmed.json();
+  assert.equal(confirmed.status, 200, confirmedBody.error);
+  assert.equal(confirmedBody.agreement.client.wallet.toLowerCase(), client.address.toLowerCase());
+
+  const commit = await fetch(`${base}/api/agreements/${createdBody.agreement.id}/commit`, {
+    method: "POST",
+    headers: headers(freelancerSession.cookie),
+    body: "{}",
+  });
+  const commitBody = await commit.json();
+  assert.equal(commit.status, 503);
+  assert.match(commitBody.error, /not configured/);
+  await app.close();
+});
+
+test("privy sign-in ignores a caller-supplied user id", async () => {
+  const { app, base } = await boot();
+  const response = await fetch(`${base}/api/auth/privy`, {
+    method: "POST",
+    headers: { ...headers(), authorization: "Bearer not-a-privy-token" },
+    body: JSON.stringify({ userId: "did:privy:fake", wallet: account().address, role: "client" }),
+  });
+  const body = await response.json();
+  if (process.env.PRIVY_APP_SECRET) {
+    assert.equal(response.status, 401);
+  } else {
+    assert.equal(response.status, 503);
+  }
+  assert.equal(body.user, undefined);
+  assert.match(body.error, /not configured|could not be verified|Sign in/i);
+  await app.close();
+});
+
+test("sample receipt is a simulated PDF", async () => {
+  const { app, base } = await boot();
+  const response = await fetch(`${base}/api/receipts/sample.pdf`, { headers: headers() });
+  assert.equal(response.status, 200);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  assert.equal(bytes.subarray(0, 4).toString(), "%PDF");
+  const decoded = pdfPlainText(bytes);
+  assert.match(decoded, /SIMULATED RECEIPT/);
+  assert.equal(decoded.includes("0x" + "ab".repeat(32)), false);
+  await app.close();
+});

@@ -4,6 +4,7 @@ import { LayoutGrid, Plus, Receipt, ScrollText, UserRound } from "lucide-react";
 import { cx, shortWallet } from "../domain/format";
 import { demoIdentity, moneyBlockReason } from "../domain/selectors";
 import type { Role, TxOutcome } from "../domain/types";
+import { useAuth } from "../auth/PrivyGate";
 import { useDemo, type Profile, type TxPhase, type TxView } from "../demo/store";
 import { enterMode } from "../mode";
 import { persistTheme, readThemeChoice, type ThemeChoice } from "../theme";
@@ -54,6 +55,7 @@ function initials(name: string): string {
 
 export function AppShell() {
   const demo = useDemo();
+  const auth = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
   const live = demo.mode === "live";
@@ -110,6 +112,16 @@ export function AppShell() {
       </header>
       <main id="content" className={cx("app-main", focusFlow && "no-nav")}>
         <div className="mx-auto grid max-w-[1120px] gap-4 px-4 pt-4 lg:px-6">
+          {live && !demo.previewLoading && !demo.profile ? (
+            <Banner tone="info" title={auth.authenticated ? "Finishing sign-in" : "Sign in"}>
+              {auth.authenticated
+                ? (auth.error || "Your sign-in worked. The wallet is still being prepared.")
+                : auth.configured
+                  ? "Continue with Google, X, email, or an existing wallet. Sign-in does not move funds or approve spending."
+                  : "Open Account and sign the message. Connecting a wallet does not sign you in, and the message does not move funds or approve spending."}
+              {auth.authenticated ? <button type="button" className="btn btn-ghost mt-2" onClick={() => { void auth.retryWallet(); }}>Retry wallet setup</button> : null}
+            </Banner>
+          ) : null}
           {live ? null : (
             <Banner tone="ok" title="Sample data">
               These agreements are stored in this browser and labelled as a sample. Freelancer and Client change whose list you are looking at. They do not sign anyone in.
@@ -177,7 +189,9 @@ export function AppShell() {
             }}
             onSignOut={() => { void demo.signOut().then(() => setAccountOpen(false)); }}
             onFaucet={() => { setAccountOpen(false); void demo.faucet(); }}
-            onSample={() => enterMode("preview", "/overview")}
+            onUseWallet={(wallet) => { void demo.switchWallet(wallet); }}
+            onLinkWallet={auth.configured ? () => auth.linkWallet() : undefined}
+            onExportWallet={auth.configured ? () => { void auth.exportWallet(); } : undefined}
           />
         ) : (
           <div className="grid gap-5">
@@ -279,7 +293,9 @@ function LiveAccount({
   onSignIn,
   onSignOut,
   onFaucet,
-  onSample,
+  onUseWallet,
+  onLinkWallet,
+  onExportWallet,
 }: {
   profile: Profile | null;
   theme: ThemeChoice;
@@ -293,7 +309,9 @@ function LiveAccount({
   onSignIn: () => void;
   onSignOut: () => void;
   onFaucet: () => void;
-  onSample: () => void;
+  onUseWallet: (wallet: string) => void;
+  onLinkWallet?: () => void;
+  onExportWallet?: () => void;
 }) {
   return (
     <div className="grid gap-5">
@@ -307,9 +325,9 @@ function LiveAccount({
         </section>
       ) : (
         <section>
-          <p className="font-extrabold">Sign in with your wallet</p>
-          <p className="mt-1 text-sm text-muted">Sign this message to sign in. This does not move funds or approve token spending.</p>
-          <Button className="mt-3" block onClick={onSignIn} unavailable={signingIn}>{signingIn ? "Check your wallet" : "Sign in"}</Button>
+          <p className="font-extrabold">Sign in</p>
+          <p className="mt-1 text-sm text-muted">Use Google, email, or an existing wallet from the start page. This wallet sign-in does not move funds or approve token spending.</p>
+          <Button className="mt-3" block onClick={onSignIn} unavailable={signingIn}>{signingIn ? "Check your wallet" : "Connect existing wallet"}</Button>
           {signError ? <p className="error-text" role="alert">{signError}</p> : null}
         </section>
       )}
@@ -324,12 +342,18 @@ function LiveAccount({
             <input className="control" value={displayName} maxLength={80} onChange={(event) => onName(event.target.value)} />
           </label>
           <Button variant="ink" onClick={onSave} unavailable={saving}>{saving ? "Saving…" : "Save profile"}</Button>
+          {(profile.wallets ?? [profile.wallet]).map((wallet) => (
+            <button key={wallet} type="button" className="btn btn-quiet" onClick={() => onUseWallet(wallet)}>
+              {wallet.toLowerCase() === profile.wallet.toLowerCase() ? "Active signer" : "Use for transactions"} · {shortWallet(wallet)}
+            </button>
+          ))}
+          {onLinkWallet ? <Button variant="ghost" onClick={onLinkWallet}>Connect another wallet</Button> : null}
+          {onExportWallet ? <Button variant="ghost" onClick={onExportWallet}>Wallet recovery</Button> : null}
           <Button variant="ghost" onClick={onFaucet}>Get test tUSDC</Button>
-          <p className="text-sm text-muted">Test tUSDC has no monetary value. The faucet only works after the test token is configured.</p>
+          <p className="text-sm text-muted">Test tUSDC has no monetary value. The token faucet only works after the test token is configured. Test MON for gas comes from the Monad faucet, which you request yourself.</p>
           <Button variant="ghost" onClick={onSignOut}>Sign out</Button>
         </div>
       ) : null}
-      <Button variant="ghost" onClick={onSample}>Look at sample data</Button>
     </div>
   );
 }

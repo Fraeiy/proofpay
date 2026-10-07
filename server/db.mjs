@@ -145,9 +145,36 @@ CREATE TABLE IF NOT EXISTS tx_attempts (
 );
 `;
 
+function migrate(db) {
+  const columns = db.prepare("PRAGMA table_info(users)").all();
+  if (!columns.some((column) => column.name === "privy_user_id")) {
+    db.exec("ALTER TABLE users ADD COLUMN privy_user_id TEXT");
+  }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_privy ON users(privy_user_id) WHERE privy_user_id IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS wallet_links (
+      privy_user_id TEXT NOT NULL,
+      wallet TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (privy_user_id, wallet)
+    );
+    CREATE TABLE IF NOT EXISTS invitations (
+      id TEXT PRIMARY KEY,
+      agreement_id TEXT NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TEXT NOT NULL,
+      claimed_wallet TEXT,
+      confirmed_at TEXT,
+      created_at TEXT NOT NULL
+    );
+  `);
+}
+
 export function openDatabase(file) {
   if (file !== ":memory:") mkdirSync(dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
   db.exec(SCHEMA);
+  migrate(db);
   return db;
 }

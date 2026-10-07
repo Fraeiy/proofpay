@@ -81,7 +81,7 @@ export async function buildReceiptPdf(receipt) {
   y -= 52;
 
   if (receipt.sample) {
-    draw("SAMPLE LAYOUT. These details are fictional and this file is not a confirmed Monad transaction. There is no explorer claim.", {
+    draw("SIMULATED RECEIPT. These details are fictional. This file is not a confirmed Monad transaction and it has no explorer link.", {
       size: 10,
       font: bold,
       leading: 14,

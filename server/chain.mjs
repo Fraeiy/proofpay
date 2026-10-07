@@ -131,9 +131,9 @@ function linkCreated(db, config, args, txHash, blockTime) {
     `).all(args.freelancer.toLowerCase(), args.client.toLowerCase(), args.termsHash.toLowerCase());
     if (matches.length === 1) agreement = matches[0];
   }
-  if (!agreement) return;
-  if (!sameAddress(agreement.freelancer_wallet, args.freelancer) || !sameAddress(agreement.client_wallet, args.client)) return;
-  if (agreement.terms_hash && agreement.terms_hash.toLowerCase() !== String(args.termsHash).toLowerCase()) return;
+  if (!agreement) return false;
+  if (!sameAddress(agreement.freelancer_wallet, args.freelancer) || !sameAddress(agreement.client_wallet, args.client)) return false;
+  if (agreement.terms_hash && agreement.terms_hash.toLowerCase() !== String(args.termsHash).toLowerCase()) return false;
   db.prepare(`
     UPDATE agreements SET
       status = CASE WHEN status = 'draft' THEN 'awaiting_acceptance' ELSE status END,
@@ -141,29 +141,29 @@ function linkCreated(db, config, args, txHash, blockTime) {
       freelancer_accepted_at = COALESCE(freelancer_accepted_at, ?), terms_hash = ?, updated_at = ?
     WHERE id = ?
   `).run(config.chainId, String(args.id), blockTime, blockTime, String(args.termsHash).toLowerCase(), blockTime, agreement.id);
+  return true;
 }
 
 export function applyDecodedEvent(db, config, decoded, log, blockTime, txHash) {
   const args = decoded.args;
   const now = blockTime;
   if (decoded.eventName === "AgreementCreated") {
-    linkCreated(db, config, args, txHash, blockTime);
-    return;
+    return linkCreated(db, config, args, txHash, blockTime);
   }
   const agreement = db.prepare("SELECT * FROM agreements WHERE chain_agreement_id = ?").get(String(args.id));
-  if (!agreement) return;
+  if (!agreement) return false;
   const index = Number(args.index ?? 0);
   const milestone = decoded.eventName === "AgreementAccepted" ? null : milestoneAt(db, agreement.id, index);
   if (decoded.eventName === "AgreementAccepted") {
-    if (agreement.terms_hash && agreement.terms_hash.toLowerCase() !== String(args.termsHash).toLowerCase()) return;
+    if (agreement.terms_hash && agreement.terms_hash.toLowerCase() !== String(args.termsHash).toLowerCase()) return false;
     db.prepare("UPDATE agreements SET client_accepted_at = COALESCE(client_accepted_at, ?), status = 'active', updated_at = ? WHERE id = ?").run(blockTime, blockTime, agreement.id);
     refreshStatus(db, agreement.id, now);
-    return;
+    return true;
   }
-  if (!milestone) return;
+  if (!milestone) return false;
   if (decoded.eventName === "MilestoneFunded") {
     const cents = baseUnitsToCents(args.amount);
-    if (cents !== milestone.amount_cents) return;
+    if (cents !== milestone.amount_cents) return false;
     db.prepare("UPDATE milestones SET phase = 'funded', funded_at = COALESCE(funded_at, ?) WHERE id = ?").run(blockTime, milestone.id);
     insertLedger(db, agreement, milestone, "fund", "confirmed", "Deposited into escrow. This is not a payment to the freelancer.", txHash, log.logIndex, config.chainId, blockTime);
   } else if (decoded.eventName === "WorkSubmitted") {
@@ -174,7 +174,7 @@ export function applyDecodedEvent(db, config, decoded, log, blockTime, txHash) {
     db.prepare("UPDATE revisions SET status = 'confirmed', tx_hash = ? WHERE id = (SELECT id FROM revisions WHERE milestone_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1)").run(txHash, milestone.id);
   } else if (decoded.eventName === "MilestonePaid") {
     const cents = baseUnitsToCents(args.amount);
-    if (cents !== milestone.amount_cents) return;
+    if (cents !== milestone.amount_cents) return false;
     db.prepare("UPDATE milestones SET phase = 'paid', paid_at = COALESCE(paid_at, ?), cancel_proposer = NULL, base_phase = NULL WHERE id = ?").run(blockTime, milestone.id);
     insertLedger(db, agreement, milestone, "release", "confirmed", "Paid in full to the freelancer, once.", txHash, log.logIndex, config.chainId, blockTime);
   } else if (decoded.eventName === "CancelProposed") {
@@ -188,11 +188,14 @@ export function applyDecodedEvent(db, config, decoded, log, blockTime, txHash) {
     db.prepare("UPDATE milestones SET cancel_proposer = NULL, cancel_nonce = ?, cancel_note = NULL, cancel_draft_note = NULL, base_phase = NULL, cancel_proposed_at = NULL WHERE id = ?").run(Number(args.nonce), milestone.id);
   } else if (decoded.eventName === "MilestoneRefunded") {
     const cents = baseUnitsToCents(args.amount);
-    if (cents !== milestone.amount_cents) return;
+    if (cents !== milestone.amount_cents) return false;
     db.prepare("UPDATE milestones SET phase = 'refunded', refunded_at = COALESCE(refunded_at, ?), cancel_proposer = NULL, cancel_note = NULL, base_phase = NULL, cancel_nonce = ? WHERE id = ?").run(blockTime, Number(args.nonce) + 1, milestone.id);
     insertLedger(db, agreement, milestone, "refund", "confirmed", "Both people agreed to this cancellation. The full amount went back to the client.", txHash, log.logIndex, config.chainId, blockTime);
+  } else {
+    return false;
   }
   refreshStatus(db, agreement.id, now);
+  return true;
 }
 
 export async function reconcileTransaction(db, client, config, txHash) {
@@ -201,11 +204,11 @@ export async function reconcileTransaction(db, client, config, txHash) {
     receipt = await client.getTransactionReceipt({ hash: txHash });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (/not found|could not be found/i.test(message)) return { status: "pending" };
-    return { status: "unknown", detail: "The network did not answer. This is not proof the transaction failed." };
+    if (/not found|could not be found/i.test(message)) return { status: "pending", settled: false };
+    return { status: "unknown", settled: false, detail: "The network did not answer. This is not proof the transaction failed, and it was not sent again." };
   }
-  if (!receipt) return { status: "pending" };
-  if (receipt.status !== "success") return { status: "reverted" };
+  if (!receipt) return { status: "pending", settled: false };
+  if (receipt.status !== "success") return { status: "reverted", settled: true };
   let blockTime = isoNow();
   try {
     const block = await client.getBlock({ blockNumber: receipt.blockNumber });
@@ -213,16 +216,24 @@ export async function reconcileTransaction(db, client, config, txHash) {
   } catch {
     blockTime = isoNow();
   }
+  let applied = 0;
   for (const log of receipt.logs) {
     if (!sameAddress(log.address, config.escrow)) continue;
     try {
       const decoded = decodeEventLog({ abi: escrowAbi, data: log.data, topics: log.topics });
-      applyDecodedEvent(db, config, decoded, log, blockTime, txHash);
+      if (applyDecodedEvent(db, config, decoded, log, blockTime, txHash)) applied += 1;
     } catch {
       continue;
     }
   }
-  return { status: "confirmed", blockTime };
+  if (applied === 0) {
+    return {
+      status: "unmatched",
+      settled: true,
+      detail: "The transaction confirmed, but it did not change this agreement. Nothing was marked held or paid.",
+    };
+  }
+  return { status: "confirmed", settled: true, blockTime };
 }
 
 export async function overlayChain(db, client, config) {

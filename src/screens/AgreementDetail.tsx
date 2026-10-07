@@ -35,12 +35,12 @@ export function AgreementDetail() {
   const [discard, setDiscard] = useState(false);
   usePageTitle(agreement?.title ?? "Agreement");
 
-  if (!agreement || (agreement.status === "draft" && (demo.mode === "live" ? demo.actingRole(agreement) === "client" : demo.state.role === "client"))) {
+  if (!agreement) {
     return (
       <div className="mx-auto max-w-3xl px-4 py-8">
         <EmptyState
-          title={agreement ? "This draft has not been shared" : demo.mode === "live" ? "This agreement is private" : "Agreement not found"}
-          body={agreement ? "The freelancer is still writing the terms. Clients see an agreement after it is shared." : demo.mode === "live" ? "Sign in with the client or freelancer wallet named when it was created. A link alone does not open the brief." : "It may have been reset from this browser."}
+          title={demo.mode === "live" ? "This agreement is private" : "Agreement not found"}
+          body={demo.mode === "live" ? "Sign in with a wallet named on the agreement. A link alone does not open the brief." : "It may have been reset from this browser."}
           action={<Button onClick={() => navigate("/agreements")}>Back to agreements</Button>}
         />
       </div>
@@ -48,9 +48,43 @@ export function AgreementDetail() {
   }
 
   if (agreement.status === "draft") {
+    const role = demo.mode === "live" ? demo.actingRole(agreement) : demo.state.role;
+    const invite = agreement.invitation;
     return (
-      <div className="mx-auto max-w-3xl px-4 py-8">
-        <EmptyState title="This is still a draft" body="Finish the terms and share them before anyone can fund a milestone." action={<Button onClick={() => navigate(`/agreements/${agreement.id}/edit`)}>Continue draft</Button>} />
+      <div className="mx-auto grid max-w-3xl gap-4 px-4 py-8">
+        <p className="text-sm font-bold text-blue-ink">Draft · not funded</p>
+        <h1 className="text-3xl font-extrabold tracking-tight">{agreement.title}</h1>
+        <p className="text-sm text-muted">These terms are not active. Funding stays closed until the client wallet is confirmed and both of you accept.</p>
+        <section className="panel p-4">
+          <p className="font-extrabold">Freelancer · {agreement.freelancer.name}</p>
+          <p className="break-all text-sm text-muted">{agreement.freelancer.wallet}</p>
+          <p className="mt-3 font-extrabold">Client · {agreement.client.name}</p>
+          <p className="break-all text-sm text-muted">{agreement.client.wallet || "Wallet not confirmed yet"}</p>
+        </section>
+        <p className="whitespace-pre-wrap text-sm">{agreement.description}</p>
+        <ol className="grid gap-3">
+          {agreement.milestones.map((milestone, index) => (
+            <li key={milestone.id} className="panel p-4">
+              <p className="font-extrabold">{index + 1}. {milestone.title}</p>
+              <p className="text-sm text-muted">{formatMoney(milestone.amount)} {TOKEN} · due {formatDate(milestone.dueDate)}</p>
+            </li>
+          ))}
+        </ol>
+        {invite?.claimedWallet && !invite.confirmed && role === "freelancer" ? (
+          <section className="panel p-4">
+            <p className="font-extrabold">Confirm this client</p>
+            <p className="mt-1 break-all text-sm">{invite.claimedWallet}</p>
+            <p className="mt-2 text-sm text-muted">A forwarded link cannot change the client until you confirm this wallet.</p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button onClick={() => void demo.confirmClient(agreement.id)}>Confirm client wallet</Button>
+              <Button variant="ghost" onClick={() => void demo.declineClient(agreement.id)}>Decline</Button>
+            </div>
+          </section>
+        ) : null}
+        {invite?.claimedWallet && !invite.confirmed && role === "client" ? (
+          <p className="text-sm text-muted">You proposed {invite.claimedWallet}. The freelancer has to confirm it before anyone can fund.</p>
+        ) : null}
+        {role === "freelancer" ? <Button variant="ink" onClick={() => navigate(`/agreements/${agreement.id}/edit`)}>Edit draft</Button> : null}
       </div>
     );
   }

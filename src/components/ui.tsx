@@ -187,7 +187,7 @@ export function Dialog({
             <h2 id={titleId} className="text-lg font-extrabold tracking-tight">{title}</h2>
             {description ? <p id={descriptionId} className="mt-1 text-sm text-muted">{description}</p> : null}
           </div>
-          <button type="button" className="grid h-11 w-11 shrink-0 place-items-center rounded-xl hover:bg-paper" aria-label="Close dialog" onClick={() => { if (!locked) onClose(); }}>
+          <button type="button" className="grid h-11 w-11 shrink-0 place-items-center rounded-xl text-ink hover:bg-paper" aria-label="Close dialog" onClick={() => { if (!locked) onClose(); }}>
             <X size={18} />
           </button>
         </div>

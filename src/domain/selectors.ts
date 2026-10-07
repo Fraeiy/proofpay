@@ -77,12 +77,12 @@ export function visibleAgreements(agreements: Agreement[], role: Role): Agreemen
   return agreements;
 }
 
-export function viewSlice(agreements: Agreement[], ledger: LedgerEntry[], role: Role, sessionWallet: string | null) {
-  const visible = sessionWallet
+export function viewSlice(agreements: Agreement[], ledger: LedgerEntry[], role: Role, sessionWallet: string | readonly string[] | null) {
+  const wallets = (Array.isArray(sessionWallet) ? sessionWallet : sessionWallet ? [sessionWallet] : []).map((wallet) => wallet.toLowerCase());
+  const visible = wallets.length
     ? agreements.filter((agreement) => {
-        const wallet = sessionWallet.toLowerCase();
-        if (role === "freelancer") return agreement.freelancer.wallet.toLowerCase() === wallet;
-        return agreement.client.wallet.toLowerCase() === wallet && agreement.status !== "draft";
+        if (role === "freelancer") return wallets.includes(agreement.freelancer.wallet.toLowerCase());
+        return Boolean(agreement.client.wallet) && wallets.includes(agreement.client.wallet.toLowerCase()) && agreement.status !== "draft";
       })
     : visibleAgreements(agreements, role);
   const ids = new Set(visible.map((agreement) => agreement.id));

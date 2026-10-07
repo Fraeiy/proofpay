@@ -22,6 +22,7 @@ export function validateAgreementInput(
   input: AgreementInput,
   freelancerWallet: string,
   today = todayISO(),
+  options: { requireClient?: boolean } = {},
 ): FieldErrors {
   const errors: FieldErrors = {};
   const title = input.title.trim();
@@ -33,8 +34,9 @@ export function validateAgreementInput(
   else if (clientName.length > 60) errors.clientName = "Keep the client name under 60 characters.";
 
   const wallet = input.clientWallet.trim();
-  if (!wallet) errors.clientWallet = "Add the client wallet address.";
-  else if (!isWallet(wallet)) errors.clientWallet = "Enter a wallet address: 0x followed by 40 hex characters.";
+  const requireClient = options.requireClient !== false;
+  if (!wallet && requireClient) errors.clientWallet = "Add the client wallet address.";
+  else if (wallet && !isWallet(wallet)) errors.clientWallet = "Enter a wallet address: 0x followed by 40 hex characters.";
   else if (wallet.toLowerCase() === freelancerWallet.trim().toLowerCase()) {
     errors.clientWallet = "The client wallet needs to be different from the freelancer wallet.";
   }

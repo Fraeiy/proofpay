@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import { ActionQueue } from "../components/ActionQueue";
+import { TestFunds } from "../components/TestFunds";
 import { AgreementCard, AgreementRow } from "../components/AgreementItem";
 import { FinancialSummary } from "../components/FinancialSummary";
 import { EmptyState } from "../components/EmptyState";
@@ -13,7 +14,7 @@ export function Overview() {
   const role = demo.state.role;
   usePageTitle("Overview");
   const today = todayISO();
-  const slice = viewSlice(demo.state.agreements, demo.state.ledger, role, demo.sessionWallet);
+  const slice = viewSlice(demo.state.agreements, demo.state.ledger, role, demo.profile?.wallets?.length ? demo.profile.wallets : demo.sessionWallet);
   const agreements = slice.agreements;
   const queue = actionQueue(agreements, role, today);
   const totals = summarize(agreements);
@@ -32,6 +33,7 @@ export function Overview() {
 
   return (
     <div className="mx-auto min-w-0 max-w-[1120px] px-4 py-6 lg:px-6">
+      {demo.mode === "live" ? <TestFunds /> : null}
       <PageIntro
         title="What needs you"
         lede={role === "freelancer"

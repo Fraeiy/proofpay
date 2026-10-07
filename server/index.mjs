@@ -27,7 +27,7 @@ function loadDeployment() {
 }
 
 const deployed = loadDeployment();
-const origins = (process.env.PROOFPAY_ORIGINS || "http://127.0.0.1:5174,http://localhost:5174").split(",").map((item) => item.trim()).filter(Boolean);
+const origins = (process.env.PROOFPAY_ORIGINS || "http://127.0.0.1:5174,http://localhost:5174,https://proofpay-pi.vercel.app").split(",").map((item) => item.trim()).filter(Boolean);
 const chainId = Number(process.env.CHAIN_ID || deployed.chainId || 10143);
 
 const { server } = createApp({

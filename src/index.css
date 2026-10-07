@@ -107,6 +107,7 @@
     background: transparent;
     font-weight: 700;
     font-size: 15px;
+    color: var(--color-ink);
     line-height: 1.1;
     text-decoration: none;
     cursor: pointer;

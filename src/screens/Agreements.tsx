@@ -25,7 +25,7 @@ export function Agreements() {
   const [filter, setFilter] = useState<AgreementFilter>("all");
   const today = todayISO();
   const role = demo.state.role;
-  const visible = viewSlice(demo.state.agreements, demo.state.ledger, role, demo.sessionWallet).agreements;
+  const visible = viewSlice(demo.state.agreements, demo.state.ledger, role, demo.profile?.wallets?.length ? demo.profile.wallets : demo.sessionWallet).agreements;
   const items = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return visible.filter((agreement) => {
